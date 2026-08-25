@@ -1,0 +1,9 @@
+fastapi 
+pandas 
+presto-python-client 
+ibm-watsonx-ai 
+python-dotenv 
+numpy
+python-dateutil 
+requests
+uvicorn
