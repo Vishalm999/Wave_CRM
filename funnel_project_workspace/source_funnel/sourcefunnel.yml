@@ -1,0 +1,208 @@
+
+
+openapi: 3.0.3
+info:
+  title: Source Wise Funnel
+  version: 1.0.0
+  description: >
+    API that generates source-wise funnel analytics
+    based on data stored in Watsonx.data.
+
+    Uses natural-language question parsing with intelligent financial-year logic (Apr–Mar).
+
+servers:
+  - url: https://sourcefunnel.23argabuhjeq.us-east.codeengine.appdomain.cloud
+    description: Production server
+  
+paths:
+  /funnel/source/question:
+    post:
+      summary: Fetch Source wise Funnel
+      description: |
+        Accepts a free-form question (e.g. "last month", "q1 2024", "mom", "yoy", "this week") and
+        automatically extracts:
+          - Date range  
+          - Analysis type  
+          - Financial-year-based boundaries  
+          - Rolling-period logic (e.g., last 6 months, last 3 quarters)
+
+        🚀 **Supported Advanced Analytics Modes:**
+          • **MoM:** month on month  
+          • **QoQ:** quarter on quarter  
+          • **YoY:** year on year  
+          • **Quarter-wise:** full Q1–Q4 breakdown  
+          • **MTD, QTD, YTD**  
+          • **Rolling windows:**  
+              - `mom last 6 months`  
+              - `qoq last 4 quarters`  
+              - `yoy last 3 years`
+
+        The API then computes:
+          - Meeting Booked (MB)
+          - Meeting Done (MD)
+          - Sales Done (SD)
+          - Ratios: MB:MD, MB:SD, MD:SD  
+        
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                question:
+                  type: string
+                  description: |
+                    Natural language question containing date logic.
+                    Examples:
+                      - "last month"
+                      - "q1 2024"
+                      - "mom last 6 months"
+                      - "yoy"
+                      - "show me funnel for april to june"
+                  example: "q2 2024 funnel for all sources"
+              required:
+                - question
+
+      responses:
+        "200":
+          description: Funnel metrics response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [success]
+                  analysis_type:
+                    type: string
+                    nullable: true
+                    example: "quarter_wise"
+                  fy:
+                    type: string
+                    nullable: true
+                    example: "FY2024"
+                  filters:
+                    type: string
+                    nullable: true
+                    example: "01-04-2024 to 30-06-2024"
+                  total_active_users:
+                    type: integer
+                    nullable: true
+                  sales_wise_user_metrics:
+                    type: object
+                    additionalProperties:
+                      $ref: "#/components/schemas/UserMetrics"
+                  data:
+                    type: array
+                    description: Returned for MoM, QoQ, YoY, Quarter-wise modes
+                    items:
+                      type: object
+                      properties:
+                        quarter:
+                          type: string
+                          nullable: true
+                          example: "Q1 FY2024"
+                        month:
+                          type: string
+                          nullable: true
+                        period:
+                          type: string
+                          example: "01-04-2024 to 30-06-2024"
+                        funnel:
+                          type: object
+                          additionalProperties:
+                            $ref: "#/components/schemas/UserMetrics"
+
+        "400":
+          description: Invalid or missing question
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [error]
+                  message:
+                    type: string
+              example:
+                status: error
+                message: "Question text is required"
+
+        "204":
+          description: No data found for the selected question or date filters
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [no_data]
+                  message:
+                    type: string
+              example:
+                status: no_data
+                message: "No sources matched with the specified date range"
+
+  /:
+    get:
+      summary: Health Check Endpoint
+      description: Simple health check to verify the API is running.
+      responses:
+        "200":
+          description: Service status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                example:
+                  message: "source-Wise Funnel Analytics API (Event & Opportunity) is running"
+
+components:
+  schemas:
+    UserMetrics:
+      type: object
+      description: Funnel metrics for source
+      properties:
+        Period:
+          type: string
+        Total Leads:
+          type: integer
+        Valid Leads:
+          type: integer
+        Junk Leads:
+          type: integer
+        SOL Leads (Interested):
+          type: integer
+        Meeting Booked:
+          type: integer
+        Meeting Done:
+          type: integer
+        Sales Done:
+          type: integer
+        Junk %:
+          type: number
+        TL:VL:
+          type: number
+        VL:SOL:
+          type: number
+        SOL:MB:
+          type: number
+        MB:MD:
+          type: number
+        MD:SD:
+          type: number
+        TL:SD:
+          type: number
+        VL:SD:
+          type: number
+        SOL:SD:
+          type: number
+        MB:SD:
+          type: number

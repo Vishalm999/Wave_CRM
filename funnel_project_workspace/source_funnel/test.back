@@ -1,0 +1,123 @@
+LOGICS
+    1. to get total leads  - the row count is the lead count from lead csv
+    2. to get junk lead - we apply filter on junk lead in the customer_feedback column and the row count is the junk lead count.
+    4. to get last year leads - we apply filter on created date of last fy from april 1st to mar 31st from the year we are in for example, if we are testing in 2026 then the filters are applied from april 1, 2025 to mar 31st 2026 and then the row count of that is the total lead count of last year.
+    5. to get valid lead - we apply filter on 
+    6. to get open lead - 
+    7. to get new lead -
+    8. to get nurturing lead -
+    9. to get lead by source - 
+    10. to get project wise lead - 
+    11. to get sub -source wise lead - 
+    12. to get product wise lead - 
+    13. to get year or year lead -
+    14. to get month on month lead -
+    continue for all reports.
+
+
+
+
+    # Lead Funnel — Logic Definitions
+
+## Valid Lead
+A lead is considered valid when the customer_feedback_c column does not equal "junk". Every lead that has any feedback value other than junk is counted as a valid lead.
+
+## Junk Lead
+A lead is considered junk when the customer_feedback_c column equals "junk". These are leads that have been marked as irrelevant or invalid.
+
+## Open Lead
+A lead is considered open when the customer_feedback_c column equals "Discussion Pending". These are leads where a conversation or follow-up is yet to happen.
+
+## New Lead
+A lead is considered new when the status column equals "new". The total count of all rows matching this condition gives the new lead count.
+
+## Qualified Lead
+A lead is considered qualified when the customer_feedback_c column equals "interested". These leads have shown interest and are moved forward in the funnel.
+
+## Unqualified Lead
+A lead is considered unqualified when the status column equals "unqualified". These leads have been reviewed and determined to not be a fit.
+
+## Cold Lead
+A lead is considered cold when the rating_c column equals "cold". These leads have low engagement or interest.
+
+## Hot Lead
+A lead is considered hot when the rating_c column equals "hot". These leads have high engagement and are close to conversion.
+
+## Warm Lead
+A lead is considered warm when the rating_c column equals "warm". These leads are moderately engaged and need further nurturing.
+
+## Nurturing Lead
+A lead is under nurturing when the status column equals "nurturing". The total count of all rows matching this condition gives the nurturing lead count.
+
+## By Source
+Leads are grouped by the lead_source_c column. Each unique value in this column represents a different lead source such as Digital, Referral, Channel Partner, etc.
+
+## Project Wise Lead
+Leads are grouped by the project_c column. Each unique value in this column represents a different project, giving a breakdown of how many leads belong to each project.
+
+## Sub-Source Lead
+Leads are grouped by the lead_source_sub_category_c column. This gives a deeper breakdown within each source, identifying the specific sub-channel that brought in the lead.
+
+## Product Wise Lead
+Leads are grouped by the product_c column. Each unique value in this column represents a product, giving a breakdown of leads per product.
+
+## Year on Year (Date Queries)
+All date-based filtering and analysis uses the created_date_c column. This applies to any query involving a specific date, date range, month, quarter, or financial year comparison such as MOM, QOQ, or YOY.
+
+## Junk Reason
+The junk_reason_c column is used to identify why a lead was marked as junk. Grouping by this column shows the distribution of junk reasons across all junk leads.
+
+## Disqualification Reason
+The disqualification_reason_c column is used to identify why a lead was disqualified. Grouping by this column shows the distribution of disqualification reasons across all unqualified leads.
+
+## Owner / Customer / Agent Wise Lead
+Leads are grouped by the OwnerName_c column. This gives a breakdown of leads assigned to each owner, agent, or customer relationship manager.
+## Sales Done
+Sales done is calculated from the opportunity report table. The sales_order_number_c column is used for this. Any row where sales_order_number_c is not null and not empty is counted as a completed sale. The total count of such rows gives the sales done count.
+
+## Opportunity Count
+The opportunity count is simply the total row count from the opportunity report table. Every row in the opportunity table represents one opportunity, so the total number of rows is the opportunity count.
+
+## Meeting Booked
+Meeting booked is calculated from the event table. The Subject_c column is used for this. Any row where Subject_c equals "Personal Appointment Booked" is counted as a booked meeting. The total count of such rows gives the meeting booked count.
+
+## Meeting Done
+Meeting done is calculated from the event table using two columns together. The Subject_c column must equal "Personal Appointment Booked" and the Appointment_Status_c column must equal "Completed". Only rows that satisfy both conditions are counted as a completed meeting. The total count of such rows gives the meeting done count.
+## Total Task
+The total task count is the total number of rows in the task report table. Every row in the task table represents one task, so the total row count is the total task count.
+
+## Follow Up Task
+Follow up tasks are identified from the task report using the subject_c column. Any row where subject_c matches any of the following values is counted as a follow up task: "Follow Up", "Sales Follow Up", "Experience Calling Follow Up", "Welcome Calling Follow Up". When the user asks for "follow up", "followup", or "follow-up", Python expands this to all four values using an IN condition.
+
+## Task Status Based Filters
+Tasks are filtered using the status_c column in the task report. The following status mappings apply:
+
+- Completed Task: status_c = "Completed"
+- Open Task: status_c = "Open"
+- In Progress Task: status_c = "In Progress"
+- Cancelled Task: status_c IN ("Cancelled", "Canceled", "Cancel") — triggered by keywords "cancelled", "canceled", or "cancel"
+- Deferred Task: status_c = "Deferred"
+- Closed Task: status_c = "Closed"
+
+## Task Feedback Based Filters
+Tasks are filtered using the sales_team_feedback_c column in the task report. The following mappings apply:
+
+- Qualified Task: sales_team_feedback_c = "Qualified"
+- Disqualified Task: sales_team_feedback_c = "Disqualified"
+
+## Task Subject Based Filters
+Tasks are filtered using the subject_c column in the task report. The following subject mappings apply:
+
+- Follow Up / Followup / Follow-up: subject_c IN ("Follow Up", "Sales Follow Up", "Experience Calling Follow Up", "Welcome Calling Follow Up")
+- Sales Follow Up: subject_c = "Sales Follow Up"
+- Re-query / Requery: subject_c = "Re-query requested"
+- Tried Calling: subject_c expands to all tried-calling related values
+- Click to Call / Click Call: subject_c expands to all click-to-call related values
+- Call Back By Sales Expert: subject_c = "Call Back By Sales Expert"
+- Experience Calling Follow Up: subject_c = "Experience Calling Follow Up"
+- Welcome Calling Follow Up: subject_c = "Welcome Calling Follow Up"
+- Request Call Back / Request Callback: subject_c = "Request call back"
+- Live Chat / Live Chat Query: subject_c = "Live Chat Query"
+
+## Total Cases / Service Requests (SR)
+The total cases or total service requests count is the total number of rows in the service request table. Every row in the service request table represents one case or SR, so the total row count is the total cases count.
