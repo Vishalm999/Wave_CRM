@@ -1,0 +1,1120 @@
+"""
+Lead Funnel Analytics API — Production-Ready
+=============================================
+Architecture:
+  - LLM (IBM Watsonx / OpenAI-compatible) handles intent + date extraction
+  - Rule-based regex acts as a fast-path fallback (never the primary path)
+  - All date parsing goes through a unified DateResolver
+  - All funnel computation goes through FunnelEngine
+  - FastAPI endpoint is thin: parse → query → compute → respond
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+from calendar import monthrange
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import numpy as np
+import pandas as pd
+import prestodb
+from dotenv import load_dotenv
+from fastapi import Body, FastAPI
+from ibm_watsonx_ai import Credentials
+from ibm_watsonx_ai.foundation_models import ModelInference
+
+# ─────────────────────────────────────────────
+# Bootstrap
+# ─────────────────────────────────────────────
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[
+        logging.FileHandler("lead_funnel.log", mode="a", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger("funnel_api")
+
+# ─────────────────────────────────────────────
+# Environment / Config
+# ─────────────────────────────────────────────
+CATALOG       = os.getenv("CATALOG", "salesforcereport")
+FUNNEL_SCHEMA = os.getenv("FUNNEL_SCHEMA", "funnel")
+FUNNEL_TABLE  = os.getenv("FUNNEL_TABLE", "sales_funnel_monthly")
+
+PRESTO_HOST   = os.getenv("PRESTO_HOST")
+PRESTO_PORT   = int(os.getenv("PRESTO_PORT", "443"))
+PRESTO_USER   = os.getenv("PRESTO_USERNAME")
+PRESTO_PASS   = os.getenv("PRESTO_PASSWORD")
+
+WATSONX_URL        = os.getenv("WATSONX_URL")
+WATSONX_PROJECT_ID = os.getenv("WATSONX_PROJECT_ID")
+MODEL_ID           = os.getenv("MODEL_ID", "meta-llama/llama-3-2-3b-instruct")
+
+# ─────────────────────────────────────────────
+# LLM Client (Watsonx)
+# ─────────────────────────────────────────────
+_llm_model: Optional[ModelInference] = None
+
+def _get_llm() -> Optional[ModelInference]:
+    global _llm_model
+    if _llm_model is not None:
+        return _llm_model
+    try:
+        creds = Credentials(url=WATSONX_URL, api_key=PRESTO_PASS)
+        _llm_model = ModelInference(
+            model_id=MODEL_ID,
+            credentials=creds,
+            project_id=WATSONX_PROJECT_ID,
+            params={"temperature": 0, "max_new_tokens": 512},
+        )
+        logger.info("LLM client initialised: %s", MODEL_ID)
+        return _llm_model
+    except Exception as exc:
+        logger.warning("LLM unavailable (%s) — falling back to regex", exc)
+        return None
+
+
+def llm_extract_intent(question: str) -> Dict[str, Any]:
+    """
+    Ask the LLM to parse the user question and return structured intent JSON.
+
+    Returns a dict with keys:
+        analysis_type : str  one of: single_period | mom | qoq | yoy |
+                                      multi_month | multi_quarter | multi_year
+        periods       : list of {"label", "start_date", "end_date"}  (YYYY-MM-DD)
+        raw_question  : str  (echo)
+
+    On any failure returns {"analysis_type": "unknown"} so the regex
+    fallback is triggered.
+    """
+    model = _get_llm()
+    if model is None:
+        return {"analysis_type": "unknown"}
+
+    today_str = datetime.today().strftime("%Y-%m-%d")
+    current_fy = datetime.today().year if datetime.today().month >= 4 else datetime.today().year - 1
+
+    system_prompt = f"""
+You are a date-range extraction assistant for a sales funnel analytics system.
+Today's date is {today_str}.  The financial year runs April 1 – March 31.
+The current financial year starts April 1, {current_fy}.
+
+Given a user question, return ONLY a valid JSON object (no markdown, no prose) with:
+{{
+  "analysis_type": "<type>",
+  "periods": [
+    {{"label": "<human label>", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD"}}
+  ]
+}}
+
+analysis_type must be exactly one of:
+  single_period   – one date range
+  mom             – month-on-month (one entry per calendar month)
+  qoq             – quarter-on-quarter (one entry per quarter Q1–Q4 of FY)
+  yoy             – year-on-year (one entry per financial year)
+  multi_month     – discrete months (e.g. "april and june")
+  multi_quarter   – discrete quarters (e.g. "Q1 and Q3")
+  multi_year      – discrete or range of years
+
+Rules:
+- Dates always YYYY-MM-DD.
+- Financial year quarters: Q1=Apr-Jun, Q2=Jul-Sep, Q3=Oct-Dec, Q4=Jan-Mar.
+- **A bare year (e.g., "2025" or "2024") ALWAYS means a financial year, NOT a calendar year. So "2025" = April 1, 2025 to March 31, 2026.**
+- "last month"  = full previous calendar month.
+- "this month"  = 1st of current month to today.
+- "last quarter" = the most recently completed FY quarter.
+- "this quarter" = current FY quarter start to today.
+- "last year" / "last FY" = previous complete financial year.
+- "this year" / "this FY" = April 1 {current_fy} to today.
+- "MTD" = month to date (1st of current month to today).
+- "YTD" = April 1 {current_fy} to today.
+- For MOM: generate one period per month in the requested range.
+- For QOQ: generate one period per quarter in the requested FY.
+- For YOY: generate the last 3 completed FYs plus the current FY-to-date.
+- For MOM Last Quarter: generate one period per month in the requested quarter.
+- Supported natural-language date formats include but are not limited to:
+    DD Month YYYY, DD/MM/YYYY, DD-MM-YYYY, Month YYYY,
+    "5th June", "Q2 FY24", "FY2023", "2023-24", "last 30 days",
+    "april to june 2024", "jan and march", "Q1 and Q3 last year".
+""".strip()
+
+    user_prompt = f'Question: "{question}"\n\nJSON:'
+
+    try:
+        raw = model.generate_text(prompt=f"{system_prompt}\n\n{user_prompt}")
+        raw = raw.strip()
+        # Strip markdown fences if present
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        parsed = json.loads(raw)
+        parsed["raw_question"] = question
+        logger.info("LLM intent: %s", parsed.get("analysis_type"))
+        return parsed
+    except Exception as exc:
+        logger.warning("LLM parse error (%s) — falling back to regex", exc)
+        return {"analysis_type": "unknown"}
+
+
+# ─────────────────────────────────────────────
+# Presto Helper
+# ─────────────────────────────────────────────
+def query_presto(catalog: str, schema: str, sql: str) -> pd.DataFrame:
+    logger.info("Presto → %s.%s", catalog, schema)
+    logger.debug("SQL:\n%s", sql)
+    print(sql)
+    try:
+        conn = prestodb.dbapi.connect(
+            host=PRESTO_HOST,
+            port=PRESTO_PORT,
+            user=PRESTO_USER,
+            catalog=catalog,
+            schema=schema,
+            http_scheme="https",
+            auth=prestodb.auth.BasicAuthentication(PRESTO_USER, PRESTO_PASS),
+        )
+        cur = conn.cursor()
+        cur.execute(sql)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        df = pd.DataFrame(rows, columns=cols)
+        logger.info("Fetched %d rows", len(df))
+        return df
+    except Exception as exc:
+        logger.error("Presto error: %s", exc, exc_info=True)
+        raise
+
+
+def fetch_funnel_data(start: date, end: date) -> pd.DataFrame:
+    sql = f"""
+        SELECT *
+        FROM {CATALOG}.{FUNNEL_SCHEMA}.{FUNNEL_TABLE}
+        WHERE DATE(period_month)
+              BETWEEN DATE '{start.isoformat()}' AND DATE '{end.isoformat()}'
+    """
+    return query_presto(CATALOG, FUNNEL_SCHEMA, sql)
+
+
+# ─────────────────────────────────────────────
+# Funnel Engine
+# ─────────────────────────────────────────────
+# Fields that must NOT be summed (ratios / percentages)
+_NON_ADDITIVE = {"%", ":"}
+
+
+def _is_additive(key: str) -> bool:
+    return not any(m in key for m in _NON_ADDITIVE)
+
+
+def compute_funnel(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Aggregate a funnel DataFrame into a typed metrics dict.
+    All column names are normalised to lower-snake so the function is
+    resilient to minor schema changes (e.g. trailing spaces, mixed case).
+    """
+    if df is None or df.empty:
+        return {}
+
+    # Normalise column names
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+
+    def _sum(col: str) -> int:
+        return int(df[col].sum()) if col in df.columns else 0
+
+    def _pct(num: int, den: int) -> str:
+        return f"{round(num / den * 100, 1)}%" if den else "0.0%"
+
+    def _ratio(num: int, den: int) -> float:
+        return round(num / den, 2) if den else 0.0
+
+    tl  = _sum("total_leads")
+    vl  = _sum("valid_leads")
+    jl  = _sum("junk_leads")
+    sol = _sum("sol_leads_interested")
+    mb  = _sum("meeting_booked")
+    md  = _sum("meeting_done")
+    sd  = _sum("sales_done")
+
+    return {
+        "Total Leads":            tl,
+        "Valid Leads":            vl,
+        "Junk Leads":             jl,
+        "SOL Leads (Interested)": sol,
+        "Meeting Booked":         mb,
+        "Meeting Done":           md,
+        "Sales Done":             sd,
+        # — percentages —
+        "Junk %":   _pct(jl, tl),
+        # — conversion ratios —
+        "TL:VL":    _ratio(tl, vl),
+        "VL:SOL":   _ratio(vl, sol),
+        "SOL:MB":   _ratio(sol, mb),
+        "MB:MD":    _ratio(mb, md),
+        "MD:SD":    _ratio(md, sd),
+        "TL:SD":    _ratio(tl, sd),
+        "VL:SD":    _ratio(vl, sd),
+        "SOL:SD":   _ratio(sol, sd),
+        "MB:SD":    _ratio(mb, sd),
+    }
+
+
+def aggregate_funnels(funnels: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Column-wise sum of additive metrics across multiple funnel dicts."""
+    totals: Dict[str, float] = {}
+    for f in funnels:
+        for k, v in f.items():
+            if _is_additive(k) and isinstance(v, (int, float)):
+                totals[k] = totals.get(k, 0.0) + v
+    return {
+        k: int(v) if float(v).is_integer() else round(v, 2)
+        for k, v in totals.items()
+    }
+
+
+# ─────────────────────────────────────────────
+# Date Utilities  (used as fallback only)
+# ─────────────────────────────────────────────
+
+def _today() -> datetime:
+    return datetime.today()
+
+
+def _current_fy() -> int:
+    t = _today()
+    return t.year if t.month >= 4 else t.year - 1
+
+
+def _fy_quarter(month: int) -> int:
+    for quarter, rng in enumerate((range(4, 7), range(7, 10), range(10, 13)), start=1):
+        if month in rng:
+            return quarter
+    return 4
+
+
+def _quarter_dates(q: int, fy: int) -> Tuple[date, date]:
+    mapping = {
+        1: (date(fy, 4, 1),      date(fy, 6, 30)),
+        2: (date(fy, 7, 1),      date(fy, 9, 30)),
+        3: (date(fy, 10, 1),     date(fy, 12, 31)),
+        4: (date(fy + 1, 1, 1),  date(fy + 1, 3, 31)),
+    }
+    return mapping[q]
+
+
+def _month_end(year: int, month: int) -> date:
+    return date(year, month, monthrange(year, month)[1])
+
+
+MONTH_MAP: Dict[str, int] = {
+    **{m: i + 1 for i, m in enumerate(
+        ["jan", "feb", "mar", "apr", "may", "jun",
+         "jul", "aug", "sep", "oct", "nov", "dec"]
+    )},
+    **{m: i + 1 for i, m in enumerate(
+        ["january", "february", "march", "april", "may", "june",
+         "july", "august", "september", "october", "november", "december"]
+    )},
+    "sept": 9,
+}
+
+WORD_NUM: Dict[str, int] = {
+    "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8,
+    "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+}
+
+_MONTH_RE = (
+    r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|"
+    r"nov(?:ember)?|dec(?:ember)?)"
+)
+
+
+# ── Keyword-based intent detection (fast path before regex) ──────────────────
+
+class AnalysisIntent(str, Enum):
+    SINGLE   = "single_period"
+    MOM      = "mom"
+    QOQ      = "qoq"
+    YOY      = "yoy"
+    MULTI_M  = "multi_month"
+    MULTI_Q  = "multi_quarter"
+    MULTI_Y  = "multi_year"
+    UNKNOWN  = "unknown"
+
+
+# Keyword → intent mapping (order matters — more-specific first)
+_INTENT_KEYWORDS: List[Tuple[AnalysisIntent, List[str]]] = [
+    (AnalysisIntent.YOY,    ["yoy", "year on year", "year-on-year", "year over year",
+                              "yearly comparison", "yoy performance"]),
+    (AnalysisIntent.QOQ,    ["qoq", "quarter on quarter", "quarter-on-quarter",
+                              "quarter wise", "quarter-wise", "quarterly trend",
+                              "quarterly comparison", "quarterwise", "quater wise"]),
+    (AnalysisIntent.MOM,    ["mom", "month on month", "month-on-month",
+                              "monthly trend", "month wise", "month-wise",
+                              "monthly comparison", "month over month"]),
+]
+
+_MULTI_Q_RE = re.compile(r"q[1-4].{0,20}(and|,).{0,20}q[1-4]", re.I)
+_MULTI_M_RE = re.compile(
+    _MONTH_RE[1:-1] + r".{0,30}(and|,).{0,30}" + _MONTH_RE[1:-1],
+    re.I
+)
+_MULTI_Y_RE = re.compile(r"(20\d{2}).{0,20}(and|,).{0,20}20\d{2}", re.I)
+
+
+def detect_intent_from_keywords(question: str) -> AnalysisIntent:
+    q = question.lower()
+    for intent, kws in _INTENT_KEYWORDS:
+        if any(kw in q for kw in kws):
+            return intent
+    if _MULTI_Q_RE.search(q):
+        return AnalysisIntent.MULTI_Q
+    if _MULTI_M_RE.search(q):
+        return AnalysisIntent.MULTI_M
+    if _MULTI_Y_RE.search(q):
+        return AnalysisIntent.MULTI_Y
+    return AnalysisIntent.UNKNOWN
+
+
+# ─────────────────────────────────────────────
+# DateResolver  — unified, priority-ordered
+# ─────────────────────────────────────────────
+
+@dataclass
+class Period:
+    label: str
+    start: date
+    end: date
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "label":      self.label,
+            "start_date": self.start.isoformat(),
+            "end_date":   self.end.isoformat(),
+        }
+
+
+class DateResolver:
+    """
+    Converts a natural-language question into a list of Period objects.
+
+    Priority:
+      1. LLM extraction  (returns structured JSON)
+      2. Keyword intent  (decides which regex sub-parser to call)
+      3. Regex sub-parsers (used as final fallback)
+      4. Default: current FY
+    """
+
+    # ── public entry point ────────────────────────────────────────────────
+    def resolve(self, question: str, llm_intent: Optional[Dict] = None) -> List[Period]:
+        # 1. Use LLM result if available and valid
+        if llm_intent and llm_intent.get("analysis_type", "unknown") != "unknown":
+            periods = self._from_llm(llm_intent)
+            if periods:
+                return periods
+            logger.warning("LLM intent conversion failed; falling back to regex")
+
+        # 2. Keyword + regex
+        return self._from_regex(question)
+
+    # ── LLM → Period conversion ───────────────────────────────────────────
+    def _from_llm(self, intent: Dict) -> List[Period]:
+        out: List[Period] = []
+        for p in intent.get("periods", []):
+            try:
+                out.append(Period(
+                    label=p["label"],
+                    start=date.fromisoformat(p["start_date"]),
+                    end=date.fromisoformat(p["end_date"]),
+                ))
+            except (KeyError, ValueError) as exc:
+                logger.warning("Bad LLM period %s: %s", p, exc)
+        return out
+
+    # ── Regex fallback ────────────────────────────────────────────────────
+    def _from_regex(self, question: str) -> List[Period]:
+        q   = question.lower().strip()
+        now = _today()
+        fy  = _current_fy()
+
+        # — single date / range —
+        pair = self._parse_date_pair(q)
+        if pair:
+            s, e = pair
+            return [Period(f"{s} to {e}", s, e)]
+
+        # — relative "last N days" —
+        p = self._last_n_days(q, now)
+        if p:
+            return [p]
+
+        # — this period (MTD / QTD / YTD / week) —
+        p = self._this_period(q, now, fy)
+        if p:
+            return [p]
+
+        # — last N months —
+        p = self._last_n_months(q, now)
+        if p:
+            return [p]
+        # — last N quarters —
+        p = self._last_n_quarters(q, now, fy)
+        if p:
+            return [p]
+
+        p = self.last_n_years(q, now, fy)
+        if p:
+            return [p]
+
+        # — last quarter —
+        p = self._last_quarter(q, now, fy)
+        if p:
+            return [p]
+
+        # — named month with / without year —
+        p = self._single_month(q, fy)
+        if p:
+            return [p]
+
+        # — month range —
+        p = self._month_range(q, fy)
+        if p:
+            return [p]
+
+        # — quarter (Q1/Q2/Q3/Q4) —
+        p = self._single_quarter(q, fy)
+        if p:
+            return [p]
+
+        # — FY explicit —
+        p = self._explicit_fy(q)
+        if p:
+            return [p]
+
+        # — year range (2022 to 2024) —
+        p = self._year_range(q)
+        if p:
+            return [p]
+
+        # — bare year —
+        yr = self._extract_year(q)
+        if yr:
+            return [Period(f"FY{yr}", date(yr, 4, 1), date(yr + 1, 3, 31))]
+
+        # — last / previous year —
+        if re.search(r"\b(last|previous)\s+(financial\s+)?year\b", q):
+            return [Period(f"FY{fy - 1}", date(fy - 1, 4, 1), date(fy, 3, 31))]
+
+        # — Default: current FY to date —
+        return [Period(f"FY{fy} YTD", date(fy, 4, 1), now.date())]
+
+    # ── helpers ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_year(text: str) -> Optional[int]:
+        m = re.search(r"\b(20\d{2})\b", text)
+        return int(m.group(1)) if m else None
+
+    @staticmethod
+    def _extract_month(text: str) -> Optional[int]:
+        for key, num in sorted(MONTH_MAP.items(), key=lambda x: -len(x[0])):
+            if re.search(rf"\b{key}\b", text):
+                return num
+        return None
+
+    @staticmethod
+    def _parse_date_pair(q: str) -> Optional[Tuple[date, date]]:
+        """
+        Handles:
+          DD/MM/YYYY, DD-MM-YYYY, DD Month YYYY,
+          "15 to 30 april 2024", "15 apr to 20 may"
+        Returns (start, end) or None.
+        """
+        # slash / hyphen pair
+        slash = re.search(
+            r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\s+to\s+(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})",
+            q,
+        )
+        if slash:
+            d1 = DateResolver._parse_dmy(slash.group(1))
+            d2 = DateResolver._parse_dmy(slash.group(2))
+            if d1 and d2:
+                return min(d1, d2), max(d1, d2)
+
+        # natural language range
+        nl = re.search(
+            r"(\d{1,2}(?:st|nd|rd|th)?\s+[a-z]+(?:\s+\d{2,4})?)"
+            r"\s+to\s+"
+            r"(\d{1,2}(?:st|nd|rd|th)?\s+[a-z]+(?:\s+\d{2,4})?)",
+            q,
+        )
+        if nl:
+            d1 = DateResolver._parse_natural(nl.group(1))
+            d2 = DateResolver._parse_natural(nl.group(2))
+            if d1 and d2:
+                return min(d1, d2), max(d1, d2)
+
+        # same-month range: "15 to 30 april 2024"
+        sm = re.search(
+            r"(\d{1,2})\s+to\s+(\d{1,2})\s+" + _MONTH_RE[1:-1] + r"(?:\s+(\d{4}))?",
+            q,
+        )
+        if sm:
+            d1_raw = f"{sm.group(1)} {sm.group(3)}"
+            d2_raw = f"{sm.group(2)} {sm.group(3)}"
+            yr = sm.group(4)
+            if yr:
+                d1_raw += f" {yr}"
+                d2_raw += f" {yr}"
+            d1 = DateResolver._parse_natural(d1_raw)
+            d2 = DateResolver._parse_natural(d2_raw)
+            if d1 and d2:
+                return min(d1, d2), max(d1, d2)
+
+        # single date
+        single = DateResolver._parse_natural(q)
+        if single:
+            return single, single
+
+        return None
+
+    @staticmethod
+    def _parse_dmy(s: str) -> Optional[date]:
+        s = s.strip()
+        for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y"):
+            try:
+                return datetime.strptime(s, fmt).date()
+            except ValueError:
+                pass
+        return None
+
+    @staticmethod
+    def _parse_natural(s: str) -> Optional[date]:
+        """Parse 'DD Month [YY[YY]]' style."""
+        s = re.sub(r"(st|nd|rd|th)", "", s).strip()
+        m = re.search(
+            r"(\d{1,2})\s+" + _MONTH_RE[1:-1] + r"(?:\s+(\d{2,4}))?",
+            s,
+        )
+        if not m:
+            return None
+        day   = int(m.group(1))
+        month = MONTH_MAP.get(m.group(2)[:3])
+        if not month:
+            return None
+        yr_raw = m.group(3)
+        if yr_raw:
+            yr = int(yr_raw)
+            if yr < 100:
+                yr += 2000
+        else:
+            fy = _current_fy()
+            yr = fy if month >= 4 else fy + 1
+        try:
+            return date(yr, month, day)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _last_n_days(q: str, now: datetime) -> Optional[Period]:
+        m = re.search(r"(?:last|past)\s+(\d+|" + "|".join(WORD_NUM) + r")\s+days?", q)
+        if not m:
+            return None
+        n = int(m.group(1)) if m.group(1).isdigit() else WORD_NUM[m.group(1)]
+        s = (now - timedelta(days=n - 1)).date()
+        return Period(f"Last {n} days", s, now.date())
+
+    @staticmethod
+    def _this_period(q: str, now: datetime, fy: int) -> Optional[Period]:
+        today = now.date()
+        if re.search(r"\b(this|current)\s+month\b|\bmtd\b", q):
+            return Period("This Month (MTD)", today.replace(day=1), today)
+        if re.search(r"\b(this|current)\s+week\b", q):
+            monday = today - timedelta(days=today.weekday())
+            return Period("This Week", monday, today)
+        if re.search(r"\b(this|current)\s+(fy|financial\s+year|year)\b|\bytd\b", q):
+            return Period(f"FY{fy} YTD", date(fy, 4, 1), today)
+        if re.search(r"\b(this|current)\s+quarter\b|\bqtd\b", q):
+            q_num = _fy_quarter(today.month)
+            s, e  = _quarter_dates(q_num, fy)
+            return Period(f"Q{q_num} FY{fy} QTD", s, min(e, today))
+        return None
+
+    @staticmethod
+    def _last_n_months(q: str, now: datetime) -> Optional[Period]:
+        m = re.search(
+            r"last\s+(\d+|" + "|".join(WORD_NUM) + r")\s+months?", q
+        )
+        if not m:
+            return None
+        n = int(m.group(1)) if m.group(1).isdigit() else WORD_NUM[m.group(1)]
+        first_this = now.date().replace(day=1)
+        end = first_this - timedelta(days=1)
+        start = end.replace(day=1)
+        for _ in range(n - 1):
+            start = (start - timedelta(days=1)).replace(day=1)
+        return Period(f"Last {n} months", start, end)
+    @staticmethod
+    def _last_n_quarters(q: str, now: datetime, fy: int) -> Optional[Period]:
+        m = re.search(r"last\s+(\d+|" + "|".join(WORD_NUM) + r")\s+quarters?", q)
+        if not m:
+            return None
+        n = int(m.group(1)) if m.group(1).isdigit() else WORD_NUM[m.group(1)]
+        curr_q = _fy_quarter(now.month)
+        end_q = curr_q - 1 if curr_q > 1 else 4
+        end_fy = fy if curr_q > 1 else fy - 1
+        end_s, end_e = _quarter_dates(end_q, end_fy)
+        start_q = end_q
+        start_fy = end_fy
+        for _ in range(n - 1):
+            start_q -= 1
+            if start_q == 0:
+                start_q = 4
+                start_fy -= 1
+        start_s, start_e = _quarter_dates(start_q, start_fy)
+        return Period(f"Last {n} quarters", start_s, end_e)
+    
+    @staticmethod
+    def last_n_years(q: str, now: datetime, fy: int) -> Optional[Period]:
+        m = re.search(r"last\s+(\d+|" + "|".join(WORD_NUM) + r")\s+years?", q)
+        if not m:
+            return None
+        n = int(m.group(1)) if m.group(1).isdigit() else WORD_NUM[m.group(1)]
+        end_fy = fy - 1 if re.search(r"\b(last|previous)\s+(financial\s+)?year\b", q) else fy
+        start_fy = end_fy - n + 1
+        return Period(f"Last {n} years", date(start_fy, 4, 1), date(end_fy + 1, 3, 31))
+
+
+    @staticmethod
+    def _last_quarter(q: str, now: datetime, fy: int) -> Optional[Period]:
+        if not re.search(r"\blast\s+quarter\b|\bprevious\s+quarter\b", q):
+            return None
+        curr_q = _fy_quarter(now.month)
+        prev_q = curr_q - 1 if curr_q > 1 else 4
+        prev_fy = fy if curr_q > 1 else fy - 1
+        s, e = _quarter_dates(prev_q, prev_fy)
+        return Period(f"Q{prev_q} FY{prev_fy}", s, e)
+
+    @staticmethod
+    def _single_month(q: str, fy: int) -> Optional[Period]:
+        m_num = DateResolver._extract_month(q)
+        if not m_num:
+            return None
+        yr = DateResolver._extract_year(q)
+        if not yr:
+            yr = fy if m_num >= 4 else fy + 1
+        return Period(
+            datetime(yr, m_num, 1).strftime("%b %Y"),
+            date(yr, m_num, 1),
+            _month_end(yr, m_num),
+        )
+
+    @staticmethod
+    def _month_range(q: str, fy: int) -> Optional[Period]:
+        sep = r"\s*(?:to|till|through|–|-|—|and)\s*"
+        pat = re.compile(_MONTH_RE[1:-1] + sep + _MONTH_RE[1:-1] + r"(?:\s+(\d{4}))?", re.I)
+        m = pat.search(q)
+        if not m:
+            return None
+        m1 = MONTH_MAP.get(m.group(1)[:3])
+        m2 = MONTH_MAP.get(m.group(2)[:3])
+        if not m1 or not m2:
+            return None
+        yr_raw = m.group(3)
+        yr = int(yr_raw) if yr_raw else fy
+        y1 = yr if m1 >= 4 else yr + 1
+        y2 = yr if m2 >= 4 else yr + 1
+        if m2 < m1:
+            y2 += 1
+        return Period(
+            f"{datetime(y1, m1, 1).strftime('%b %Y')} – {datetime(y2, m2, 1).strftime('%b %Y')}",
+            date(y1, m1, 1),
+            _month_end(y2, m2),
+        )
+
+    @staticmethod
+    def _single_quarter(q: str, fy: int) -> Optional[Period]:
+        m = re.search(r"\bq([1-4])\b", q, re.I)
+        if not m:
+            return None
+        q_num = int(m.group(1))
+        # optional explicit FY
+        fy_m = re.search(r"\bfy\s*(\d{2,4})\b", q, re.I)
+        if fy_m:
+            v = int(fy_m.group(1))
+            fy = v if v > 100 else 2000 + v
+        if re.search(r"\b(last|previous)\s+(year|fy)\b", q):
+            fy -= 1
+        s, e = _quarter_dates(q_num, fy)
+        return Period(f"Q{q_num} FY{fy}", s, e)
+
+    @staticmethod
+    def _explicit_fy(q: str) -> Optional[Period]:
+        m = re.search(r"\bfy\s*(\d{2,4})\b", q, re.I)
+        if not m:
+            if "financial year" not in q:
+                return None
+            m = re.search(r"financial\s+year\s+(\d{4})", q, re.I)
+            if not m:
+                return None
+        v = int(m.group(1))
+        yr = v if v > 100 else 2000 + v
+        return Period(f"FY{yr}", date(yr, 4, 1), date(yr + 1, 3, 31))
+
+    @staticmethod
+    def _year_range(q: str) -> Optional[Period]:
+        m = re.search(r"\b(20\d{2})\s*(?:to|–|-|—)\s*(20\d{2})\b", q)
+        if not m:
+            m = re.search(r"\bfy\s*(\d{2})\s*(?:to|-)\s*fy?\s*(\d{2})\b", q, re.I)
+            if not m:
+                return None
+            y1, y2 = 2000 + int(m.group(1)), 2000 + int(m.group(2))
+        else:
+            y1, y2 = int(m.group(1)), int(m.group(2))
+        return Period(
+            f"FY{min(y1, y2)} to FY{max(y1, y2)}",
+            date(min(y1, y2), 4, 1),
+            date(max(y1, y2) + 1, 3, 31),
+        )
+
+
+
+def _mom_periods(question: str) -> List[Period]:
+    """
+    Generate a list of month periods (one per month) for MOM analysis.
+    Handles explicit quarters, relative periods like 'last quarter', 'this quarter', etc.
+    
+    Financial Year (FY) System:
+      - FY2026 runs from April 1, 2025 to March 31, 2026
+      - Q1: April-May-June
+      - Q2: July-August-September  
+      - Q3: October-November-December
+      - Q4: January-February-March
+    """
+    dr = DateResolver()
+    base = dr.resolve(question)  # single period for the envelope
+    now = _today()
+    fy = _current_fy()
+    q = question.lower()
+    today = now.date()
+
+    # --- Handle "last quarter" explicitly ---
+    if re.search(r"\blast\s+quarter\b|\bprevious\s+quarter\b", q):
+        # Determine the previous quarter relative to the current FY quarter
+        curr_q = _fy_quarter(today.month)
+        
+        # For "last quarter", we want the quarter before the current one
+        if curr_q == 1:
+            # If we're in Q1 (Apr-Jun), last quarter is Q4 of previous FY
+            prev_q = 4
+            prev_fy = fy - 1
+        else:
+            # For Q2, Q3, Q4: just move back one quarter in current FY
+            prev_q = curr_q - 1
+            prev_fy = fy
+        
+        s, e = _quarter_dates(prev_q, prev_fy)
+    # --- Handle "this quarter" ---
+    elif re.search(r"\bthis\s+quarter\b|\bcurrent\s+quarter\b", q):
+        curr_q = _fy_quarter(today.month)
+        s, e = _quarter_dates(curr_q, fy)
+        # Limit end date to today for current quarter
+        e = min(e, today)
+    # --- Handle explicit quarter like Q1, Q2, etc. ---
+    elif (qm := re.search(r"\bq([1-4])\b", q, re.I)):
+        q_num = int(qm.group(1))
+        fy_m = re.search(r"\bfy\s*(\d{2,4})\b", q, re.I)
+        if fy_m:
+            v = int(fy_m.group(1))
+            fy = v if v > 100 else 2000 + v
+        if re.search(r"\b(last|previous)\s+(year|fy)\b", q):
+            fy -= 1
+        s, e = _quarter_dates(q_num, fy)
+    # --- Handle last year, this year, etc. ---
+    elif re.search(r"\b(last|previous)\s+(year|fy)\b", q):
+        s, e = date(fy - 1, 4, 1), date(fy, 3, 31)
+    elif re.search(r"\b(this|current)\s+(year|fy)\b", q):
+        s, e = date(fy, 4, 1), today
+    elif base:
+        s, e = base[0].start, base[0].end
+    else:
+        s, e = date(fy, 4, 1), today
+
+    # Generate months from s to e (one Period per month)
+    periods = []
+    cur = s.replace(day=1)
+    while cur <= e:
+        me = _month_end(cur.year, cur.month)
+        end = min(me, e, today)
+        lbl = cur.strftime("%b %Y")
+        # Mark if this is the current month (Month-To-Date)
+        if cur.year == today.year and cur.month == today.month:
+            lbl += " (MTD)"
+        periods.append(Period(lbl, cur, end))
+        
+        # Advance to next month
+        if cur.month == 12:
+            cur = date(cur.year + 1, 1, 1)
+        else:
+            cur = date(cur.year, cur.month + 1, 1)
+    
+    return periods
+
+
+def _qoq_periods(question: str) -> List[Period]:
+    q   = question.lower()
+    fy  = _current_fy()
+    fy_m = re.search(r"\bfy\s*(\d{2,4})\b", q, re.I)
+    if fy_m:
+        v = int(fy_m.group(1)); fy = v if v > 100 else 2000 + v
+    if re.search(r"\b(last|previous)\s+(year|fy)\b", q):
+        fy -= 1
+    yr_m = re.search(r"\b(20\d{2})\b", q)
+    if yr_m:
+        fy = int(yr_m.group(1))
+    return [
+        Period(f"Q{i} FY{fy}", *_quarter_dates(i, fy))
+        for i in range(1, 5)
+    ]
+
+
+def _yoy_periods() -> List[Period]:
+    fy = _current_fy()
+    today = _today().date()
+    periods = []
+    for past_fy in [fy - 3, fy - 2, fy - 1]:
+        periods.append(Period(f"FY{past_fy}", date(past_fy, 4, 1), date(past_fy + 1, 3, 31)))
+    periods.append(Period(f"FY{fy} YTD", date(fy, 4, 1), today))
+    return periods
+
+
+def _multi_quarter_periods(question: str) -> List[Period]:
+    q  = question.lower()
+    fy = _current_fy()
+    if re.search(r"\b(last|previous)\s+(year|fy)\b", q): fy -= 1
+    yr_m = re.search(r"\b(20\d{2})\b", q)
+    if yr_m: fy = int(yr_m.group(1))
+    fy_m = re.search(r"\bfy\s*(\d{2,4})\b", q, re.I)
+    if fy_m:
+        v = int(fy_m.group(1)); fy = v if v > 100 else 2000 + v
+
+    q_nums = [int(x) for x in re.findall(r"\bq([1-4])\b", q, re.I)]
+    if not q_nums:
+        return []
+    is_range = " to " in q
+    if is_range:
+        q_nums = list(range(min(q_nums), max(q_nums) + 1))
+    return [Period(f"Q{n} FY{fy}", *_quarter_dates(n, fy)) for n in sorted(set(q_nums))]
+
+
+def _multi_month_periods(question: str) -> List[Period]:
+    q  = question.lower()
+    fy = _current_fy()
+    if re.search(r"\b(last|previous)\s+(year|fy)\b", q): fy -= 1
+    yr_m = re.search(r"\b(20\d{2})\b", q)
+    if yr_m: fy = int(yr_m.group(1))
+
+    month_names = re.findall(_MONTH_RE, q)
+    periods: List[Period] = []
+    for mn in month_names:
+        m_num = MONTH_MAP.get(mn[:3])
+        if not m_num: continue
+        yr = fy if m_num >= 4 else fy + 1
+        s  = date(yr, m_num, 1)
+        e  = _month_end(yr, m_num)
+        periods.append(Period(datetime(yr, m_num, 1).strftime("%b %Y"), s, e))
+    return periods
+
+
+def _multi_year_periods(question: str) -> List[Period]:
+    q  = question.lower()
+    years = sorted(set(int(y) for y in re.findall(r"\b(20\d{2})\b", q)))
+    if not years:
+        return []
+    is_range = " to " in q or re.search(r"20\d{2}\s*[-–—]\s*20\d{2}", q)
+    if is_range:
+        years = list(range(years[0], years[-1] + 1))
+    return [
+        Period(f"FY{y}", date(y, 4, 1), date(y + 1, 3, 31))
+        for y in years
+    ]
+
+
+# ─────────────────────────────────────────────
+# Response Builders
+# ─────────────────────────────────────────────
+
+def _run_period(period: Period) -> Dict[str, Any]:
+    """Fetch data for one period and compute funnel metrics."""
+    try:
+        df = fetch_funnel_data(period.start, period.end)
+    except Exception as exc:
+        logger.error("DB error for %s: %s", period.label, exc)
+        return {"label": period.label, "error": str(exc)}
+
+    if df.empty:
+        logger.warning("No data for %s", period.label)
+
+    funnel = compute_funnel(df)
+    return {
+        "label":  period.label,
+        "period": f"{period.start.isoformat()} to {period.end.isoformat()}",
+        "funnel": funnel,
+    }
+
+
+def _build_single_response(period: Period) -> Dict[str, Any]:
+    result = _run_period(period)
+    return {
+        "status":        "success",
+        "analysis_type": AnalysisIntent.SINGLE,
+        "filter":        result.get("period"),
+        "lead_funnel":   result.get("funnel", {}),
+        "totals":        aggregate_funnels([result.get("funnel", {})]),
+    }
+
+
+def _build_multi_response(
+    analysis_type: str,
+    periods: List[Period],
+    label_key: str = "label",
+) -> Dict[str, Any]:
+    results = [_run_period(p) for p in periods]
+    funnels = [r.get("funnel", {}) for r in results]
+    return {
+        "status":        "success",
+        "analysis_type": analysis_type,
+        "data":          results,
+        "totals":        aggregate_funnels(funnels),
+    }
+
+
+# ─────────────────────────────────────────────
+# FastAPI App
+# ─────────────────────────────────────────────
+app = FastAPI(
+    title="Lead Funnel Analytics API",
+    description="IBM Watsonx-powered sales funnel with LLM intent extraction",
+    version="2.0.0",
+)
+
+_resolver = DateResolver()
+
+
+@app.post("/funnel/leadfunnel/question")
+async def lead_funnel_from_question(payload: dict = Body(...)):
+    question = payload.get("question", "").strip()
+    if not question:
+        return {"status": "error", "message": "question is required"}
+
+    logger.info("Request: %s", question)
+
+    # ── Step 1: LLM intent extraction ─────────────────────────────────────
+    llm_intent = llm_extract_intent(question)
+    analysis_type = llm_intent.get("analysis_type", "unknown")
+
+    print(f"LLM intent: {llm_intent}")
+    # ── Step 2: If LLM gave a valid multi-period intent, use it directly ──
+    if analysis_type != "unknown":
+        # Convert LLM periods to Period objects
+        llm_periods = _resolver._from_llm(llm_intent)
+
+        if llm_periods:
+            if analysis_type == AnalysisIntent.SINGLE:
+                return _build_single_response(llm_periods[0])
+
+            return _build_multi_response(analysis_type, llm_periods)
+
+    # ── Step 3: Keyword-based intent detection (fast path) ────────────────
+    kw_intent = detect_intent_from_keywords(question)
+
+    if kw_intent == AnalysisIntent.YOY:
+        periods = _yoy_periods()
+        return _build_multi_response("year_on_year", periods)
+
+    if kw_intent == AnalysisIntent.QOQ:
+        periods = _qoq_periods(question)
+        return _build_multi_response("quarter_on_quarter", periods)
+
+    if kw_intent == AnalysisIntent.MOM:
+        periods = _mom_periods(question)
+        return _build_multi_response("month_on_month", periods)
+
+    if kw_intent == AnalysisIntent.MULTI_Q:
+        periods = _multi_quarter_periods(question)
+        if periods:
+            return _build_multi_response("multi_quarter", periods)
+
+    if kw_intent == AnalysisIntent.MULTI_M:
+        periods = _multi_month_periods(question)
+        if periods:
+            return _build_multi_response("multi_month", periods)
+
+    if kw_intent == AnalysisIntent.MULTI_Y:
+        periods = _multi_year_periods(question)
+        if periods:
+            return _build_multi_response("multi_year", periods)
+
+    # ── Step 4: Generic date resolution (regex fallback) ──────────────────
+    periods = _resolver.resolve(question, llm_intent)
+    if len(periods) == 1:
+        return _build_single_response(periods[0])
+
+    return _build_multi_response("multi_period", periods)
+
+
+@app.get("/")
+async def health_check():
+    return {
+        "status":  "ok",
+        "service": "Lead Funnel Analytics API v2",
+        "llm":     MODEL_ID,
+    }
+
+
+@app.get("/supported-formats")
+async def supported_formats():
+    """Return all supported natural-language date formats."""
+    return {
+        "single_date": [
+            "15 April 2024", "15/04/2024", "15-04-2024",
+            "5th June", "Jun 2024", "April",
+        ],
+        "date_range": [
+            "15 April to 30 June 2024",
+            "15/04/2024 to 30/06/2024",
+            "April to June",
+            "April to June 2024",
+            "April 2022 to June 2025",
+        ],
+        "relative": [
+            "last 30 days", "last 3 months", "last week",
+            "last month", "last quarter", "last year", "last FY",
+            "this month", "this quarter", "this year", "this FY",
+            "MTD", "QTD", "YTD",
+        ],
+        "quarter": [
+            "Q1", "Q2 FY24", "Q3 2024",
+            "Q1 and Q3", "Q1 to Q3", "last quarter",
+        ],
+        "financial_year": [
+            "FY24", "FY2024", "FY 2024",
+            "2023-24", "2022 to 2024",
+            "financial year 2024",
+        ],
+        "comparative": [
+            "MOM", "month on month", "month-wise",
+            "QOQ", "quarter on quarter", "quarterly",
+            "YOY", "year on year", "year-over-year",
+        ],
+    }
